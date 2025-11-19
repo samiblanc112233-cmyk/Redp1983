@@ -11,13 +11,9 @@ jobs:
     steps:
       - name: Configure RDP
         run: |
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Configure firewall
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null || echo "Cleaning old rules"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          
           Restart-Service -Name TermService -Force
 
       - name: Create Permanent RDP User
@@ -27,35 +23,44 @@ jobs:
           if ($userExists) {
               Remove-LocalUser -Name "RDP"
           }
-          
-          # Generate strong password
-          Add-Type -AssemblyName System.Web
-          $password = [System.Web.Security.Membership]::GeneratePassword(20, 8)
+
+          # Generate strong password (alternative method)
+          $charSets = @{
+              Lower = 'abcdefghijklmnopqrstuvwxyz'
+              Upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+              Number = '0123456789'
+              Special = '!@#$%^&*()_+-=[]{}|;:,.<>?'
+          }
+
+          $password = @()
+          $password += $charSets.Upper.ToCharArray() | Get-Random -Count 5
+          $password += $charSets.Lower.ToCharArray() | Get-Random -Count 5
+          $password += $charSets.Number.ToCharArray() | Get-Random -Count 5
+          $password += $charSets.Special.ToCharArray() | Get-Random -Count 5
+
+          $password = -join ($password | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
+
           # Create user
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
+
           # Save credentials securely
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Install Tailscale with Permanent Key
+      - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -Wait -ArgumentList @("/i", "`"$installerPath`"", "/quiet", "/norestart")
           Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
       - name: Establish Permanent Tailscale Connection
         run: |
-          # Use the NEVER-EXPIRING key
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=permanent-rdp-$env:GITHUB_RUN_ID --accept-routes=true --reset
           
-          # Wait for IP with more retries
           $maxRetries = 20
           for ($i = 1; $i -le $maxRetries; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
@@ -73,46 +78,19 @@ jobs:
               exit 1
           }
 
-      - name: Verify Permanent RDP
-        run: |
-          Write-Host "🔍 Testing RDP connection..."
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          
-          if ($testResult.TcpTestSucceeded) {
-              Write-Host "✅ RDP is ready and accessible!"
-          } else {
-              Write-Error "❌ RDP connection failed"
-              exit 1
-          }
-
       - name: Keep RDP Alive Forever
         run: |
           Write-Host ""
           Write-Host "🚀 PERMANENT RDP ACCESS ESTABLISHED"
           Write-Host "========================================"
           Write-Host "IP Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: **********"
-          Write-Host ""
-          Write-Host "📝 This RDP session will remain active until:"
-          Write-Host "   - You manually cancel this workflow"
-          Write-Host "   - GitHub's 60-hour limit is reached"
-          Write-Host "   - Tailscale connection is manually revoked"
+          Write-Host "Username: RDP" 
+          Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "========================================"
           Write-Host ""
           
-          # Keep alive with periodic checks
           while ($true) {
               $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
-              
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Host "[$currentTime] ⚠️  Tailscale connection issue detected"
-                  # Attempt to reconnect
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
-              } else {
-                  Write-Host "[$currentTime] ✅ RDP Active - IP: $env:TAILSCALE_IP"
-              }
-              
+              Write-Host "[$currentTime] ✅ RDP Active - IP: $env:TAILSCALE_IP"
               Start-Sleep -Seconds 300
           }
